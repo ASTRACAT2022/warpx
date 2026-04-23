@@ -228,6 +228,29 @@ function error_exit {
     exit 1
 }
 
+function l10n {
+    local ru="$1"
+    local en="$2"
+    if [[ "$SCRIPT_LANG" == "ru" ]]; then
+        echo "$ru"
+    else
+        echo "$en"
+    fi
+}
+
+function curl_error_hint {
+    local code="$1"
+    case "$code" in
+        6) l10n "DNS не смог разрешить имя хоста." "DNS could not resolve the hostname." ;;
+        7) l10n "Не удалось подключиться к удалённому хосту." "Failed to connect to the remote host." ;;
+        28) l10n "Таймаут запроса." "Request timed out." ;;
+        35) l10n "Ошибка TLS/SSL рукопожатия." "TLS/SSL handshake error." ;;
+        52) l10n "Пустой ответ от сервера." "Empty reply from server." ;;
+        56) l10n "Соединение было сброшено во время передачи данных." "Connection was reset during data transfer." ;;
+        *) l10n "Неизвестная ошибка curl." "Unknown curl error." ;;
+    esac
+}
+
 if [[ $EUID -ne 0 ]]; then
     fail "This script must be run as root / Этот скрипт должен быть запущен от имени root"
     exit 1
@@ -419,30 +442,106 @@ if ! wg show warp &>/dev/null; then
     fail "$(msg "warp_not_found")"
     exit 1
 fi
+ok "$(l10n "Интерфейс warp найден." "WARP interface found.")"
 
-for i in {1..10}; do
-    handshake=$(wg show warp | grep "latest handshake" | awk -F': ' '{print $2}')
-    if [[ "$handshake" == *"second"* || "$handshake" == *"minute"* ]]; then
-        ok "$(msg "handshake_received") $handshake"
+if ip link show warp 2>/dev/null | grep -q "state UP"; then
+    ok "$(l10n "Состояние интерфейса: UP." "Interface state: UP.")"
+else
+    warn "$(l10n "Состояние интерфейса не UP, продолжаем диагностику." "Interface state is not UP, continuing diagnostics.")"
+fi
+
+configured_dns=$(awk -F' *= *' '/^DNS *=/ {print $2; exit}' /etc/wireguard/warp.conf 2>/dev/null | xargs)
+if [[ -n "$configured_dns" ]]; then
+    info "$(l10n "DNS в warp.conf: ${configured_dns}" "DNS in warp.conf: ${configured_dns}")"
+    if [[ "$configured_dns" == "$CUSTOM_DNS" ]]; then
+        ok "$(l10n "DNS в конфиге совпадает с ${CUSTOM_DNS}." "Config DNS matches ${CUSTOM_DNS}.")"
+    else
+        warn "$(l10n "DNS в конфиге отличается от ${CUSTOM_DNS}." "Config DNS differs from ${CUSTOM_DNS}.")"
+    fi
+else
+    warn "$(l10n "Параметр DNS в warp.conf не найден." "DNS parameter not found in warp.conf.")"
+fi
+
+peer_endpoint=$(wg show warp endpoints 2>/dev/null | awk 'NR==1 {print $2}')
+if [[ -n "$peer_endpoint" && "$peer_endpoint" != "(none)" ]]; then
+    info "$(l10n "Endpoint пира: ${peer_endpoint}" "Peer endpoint: ${peer_endpoint}")"
+else
+    warn "$(l10n "Endpoint пира не определён." "Peer endpoint is not defined.")"
+fi
+
+info "$(l10n "Проверяем handshake (до 20 секунд)..." "Checking handshake (up to 20 seconds)...")"
+for i in {1..20}; do
+    handshake_ts=$(wg show warp latest-handshakes 2>/dev/null | awk 'NR==1 {print $2}')
+    if [[ "$handshake_ts" =~ ^[0-9]+$ ]] && (( handshake_ts > 0 )); then
+        now_ts=$(date +%s)
+        handshake_age=$((now_ts - handshake_ts))
+        if (( handshake_age < 0 )); then
+            handshake_age=0
+        fi
+        ok "$(msg "handshake_received") ~${handshake_age}s"
         ok "$(msg "warp_active")"
         break
     fi
     sleep 1
 done
 
-if [[ -z "$handshake" || "$handshake" == "0 seconds ago" ]]; then
+if [[ ! "$handshake_ts" =~ ^[0-9]+$ ]] || (( handshake_ts == 0 )); then
     warn "$(msg "handshake_failed")"
 fi
 
-curl_result=$(curl -s --interface warp https://www.cloudflare.com/cdn-cgi/trace | grep "warp=" | cut -d= -f2)
+trace_tmp_file=$(mktemp /tmp/warp-trace.XXXXXX)
+trace_url="https://www.cloudflare.com/cdn-cgi/trace"
+dns_http_ok=false
 
-if [[ "$curl_result" == "plus" ]]; then
-    ok "$(msg "cf_response_plus")"
-elif [[ "$curl_result" == "on" ]]; then
-    ok "$(msg "cf_response")"
+info "$(l10n "Тест 1/2: DNS + HTTP через hostname..." "Test 1/2: DNS + HTTP via hostname...")"
+http_code=$(curl --interface warp -sS --max-time 15 -o "$trace_tmp_file" -w "%{http_code}" "$trace_url")
+curl_rc=$?
+if [[ $curl_rc -eq 0 ]]; then
+    dns_http_ok=true
+    ok "$(l10n "DNS работает: домен успешно разрешён." "DNS works: hostname resolved.")"
+    if [[ "$http_code" == "200" ]]; then
+        ok "$(l10n "HTTP через WARP работает (код ${http_code})." "HTTP via WARP works (code ${http_code}).")"
+    else
+        warn "$(l10n "HTTP через WARP вернул код ${http_code} (ожидали 200)." "HTTP via WARP returned code ${http_code} (expected 200).")"
+    fi
+else
+    curl_hint=$(curl_error_hint "$curl_rc")
+    warn "$(l10n "curl завершился с кодом ${curl_rc}: ${curl_hint}" "curl exited with code ${curl_rc}: ${curl_hint}")"
+fi
+
+info "$(l10n "Тест 2/2: HTTP в обход DNS (--resolve)." "Test 2/2: HTTP bypassing DNS (--resolve).")"
+bypass_http_code=$(curl --interface warp -sS --max-time 15 --resolve www.cloudflare.com:443:1.1.1.1 -o /dev/null -w "%{http_code}" "$trace_url")
+bypass_rc=$?
+if [[ $bypass_rc -eq 0 ]]; then
+    if [[ "$bypass_http_code" == "200" ]]; then
+        ok "$(l10n "HTTP в обход DNS работает (код ${bypass_http_code})." "HTTP bypassing DNS works (code ${bypass_http_code}).")"
+    else
+        warn "$(l10n "HTTP в обход DNS вернул код ${bypass_http_code}." "HTTP bypassing DNS returned code ${bypass_http_code}.")"
+    fi
+else
+    bypass_hint=$(curl_error_hint "$bypass_rc")
+    warn "$(l10n "Тест в обход DNS провалился, curl код ${bypass_rc}: ${bypass_hint}" "Bypass DNS test failed, curl code ${bypass_rc}: ${bypass_hint}")"
+fi
+
+if [[ "$dns_http_ok" == false && $bypass_rc -eq 0 ]]; then
+    warn "$(l10n "Похоже, проблема именно в DNS/резолве." "It looks like the issue is DNS resolution.")"
+fi
+
+if [[ $curl_rc -eq 0 ]]; then
+    curl_result=$(grep "^warp=" "$trace_tmp_file" | head -n1 | cut -d= -f2 | tr -d '\r')
+    if [[ "$curl_result" == "plus" ]]; then
+        ok "$(msg "cf_response_plus")"
+    elif [[ "$curl_result" == "on" ]]; then
+        ok "$(msg "cf_response")"
+    elif [[ -n "$curl_result" ]]; then
+        warn "$(l10n "Cloudflare trace вернул warp=${curl_result}." "Cloudflare trace returned warp=${curl_result}.")"
+    else
+        warn "$(l10n "Cloudflare trace не содержит поля warp=." "Cloudflare trace does not contain warp= field.")"
+    fi
 else
     warn "$(msg "cf_not_confirmed")"
 fi
+rm -f "$trace_tmp_file"
 
 wgcf_account_type=$(wgcf status 2>/dev/null | grep -i "Account type" | awk -F': ' '{print $2}' | xargs)
 if [[ "$wgcf_account_type" == "unlimited" ]]; then
