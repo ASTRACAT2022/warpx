@@ -29,7 +29,7 @@ It automates:
 Install on each required node:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ASTRACAT2022/warp-native/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/ASTRACAT2022/warpx/main/install.sh)
 ```
 
 ### Option 2: Ansible Role (Recommended for automation)
